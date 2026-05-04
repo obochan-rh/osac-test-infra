@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import shlex
+
 import pytest
 
 from tests.osac_cli import OsacCLI
@@ -28,6 +31,16 @@ def service_account() -> str:
     return env("OSAC_SERVICE_ACCOUNT", "admin")
 
 
+def _oc_token_script(*, namespace: str, service_account: str) -> str:
+    """Shell snippet for osac --token-script; embed KUBECONFIG so oc sees the hub when osac drops env."""
+    kc: str = (os.environ.get("OSAC_HUB_KUBECONFIG") or os.environ.get("KUBECONFIG") or "").strip()
+    prefix: str = f"KUBECONFIG={shlex.quote(kc)} " if kc else ""
+    return (
+        f"{prefix}oc create token -n {namespace} {service_account} "
+        f"--duration 1h --as system:admin"
+    )
+
+
 @pytest.fixture(scope="session")
 def grpc(fulfillment_address: str, namespace: str, service_account: str) -> GRPCClient:
     token: str = run(
@@ -46,9 +59,6 @@ def cli(namespace: str, fulfillment_address: str, service_account: str) -> OsacC
     return OsacCLI(
         binary=env("OSAC_CLI_PATH", "osac"),
         address=f"https://{fulfillment_address.rsplit(':', 1)[0]}",
-        token_script=(
-            f"oc create token -n {namespace} {service_account} "
-            f"--duration 1h --as system:admin"
-        ),
+        token_script=_oc_token_script(namespace=namespace, service_account=service_account),
         namespace=namespace,
     )

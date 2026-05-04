@@ -46,6 +46,9 @@ def cli(namespace: str, fulfillment_address: str, service_account: str) -> OsacC
     return OsacCLI(
         binary=env("OSAC_CLI_PATH", "osac"),
         address=f"https://{fulfillment_address.rsplit(':', 1)[0]}",
-        token_script=f"oc create token -n {namespace} {service_account} --as system:admin",
+        token_script=(
+            f"oc create token -n {namespace} {service_account} "
+            f"--duration 1h --as system:admin"
+        ),
         namespace=namespace,
     )

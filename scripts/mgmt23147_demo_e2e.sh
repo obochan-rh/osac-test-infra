@@ -39,6 +39,9 @@
 #   POLL_EARLY_SECONDS       (default 90) wall-clock window for --poll-early
 #   POLL_EARLY_INTERVAL      (default 10) seconds between polls for --poll-early
 #   DELETE_WAIT_RETRIES / DELETE_WAIT_DELAY  (default 60 / 5) wait for CR gone after delete-during-provision
+#   DEMO_PAUSE_BEFORE_DESCRIBE_SEC   (default 5) sleep before oc describe (narrate vs plan YAML)
+#   DEMO_PAUSE_AFTER_DESCRIBE_SEC    (default 4) sleep after describe + events before next step (0 to disable)
+#   bash .../mgmt23147_demo_e2e.sh --no-describe   # skip oc describe + events block
 
 set -euo pipefail
 
@@ -48,6 +51,7 @@ PREVIEW_ONLY=0
 DEMO_STEP="${DEMO_STEP:-0}"
 POLL_EARLY=0
 DELETE_DURING=0
+SKIP_DESCRIBE=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --keep) KEEP=1 ;;
@@ -56,8 +60,9 @@ while [[ $# -gt 0 ]]; do
     --step) DEMO_STEP=1 ;;
     --poll-early) POLL_EARLY=1 ;;
     --delete-during-provision) DELETE_DURING=1 ;;
+    --no-describe) SKIP_DESCRIBE=1 ;;
     -h|--help)
-      sed -n '1,75p' "$0"
+      sed -n '1,90p' "$0"
       exit 0
       ;;
     *)
@@ -81,6 +86,8 @@ POLL_EARLY_SECONDS="${POLL_EARLY_SECONDS:-90}"
 POLL_EARLY_INTERVAL="${POLL_EARLY_INTERVAL:-10}"
 DELETE_WAIT_RETRIES="${DELETE_WAIT_RETRIES:-60}"
 DELETE_WAIT_DELAY="${DELETE_WAIT_DELAY:-5}"
+DEMO_PAUSE_BEFORE_DESCRIBE_SEC="${DEMO_PAUSE_BEFORE_DESCRIBE_SEC:-5}"
+DEMO_PAUSE_AFTER_DESCRIBE_SEC="${DEMO_PAUSE_AFTER_DESCRIBE_SEC:-4}"
 
 oc_hub() {
   if [[ -n "$HUB_KC" ]]; then
@@ -176,6 +183,8 @@ YAML
     echo "──────── Optional: --delete-during-provision (scenario 5) ────────"
     echo "After provision job is Running/Pending/Unknown: osac delete; wait CR gone. (Skips Running wait; ignores --poll-early / --scenario-config-gap.)"
   fi
+  echo "──────── After CR exists (default) ────────"
+  echo "oc describe computeinstance <name>; oc get events ... (pauses DEMO_PAUSE_BEFORE_DESCRIBE_SEC / DEMO_PAUSE_AFTER_DESCRIBE_SEC). Skip with --no-describe."
   echo
 }
 
@@ -247,6 +256,40 @@ print_events() {
     --field-selector "involvedObject.kind=ComputeInstance,involvedObject.name=${name}" \
     --sort-by='.lastTimestamp' 2>/dev/null | tail -15 || true
   echo
+}
+
+# After CR exists: describe (spec + status + embedded events) + table events (REASON / MESSAGE).
+show_describe_and_events() {
+  local name="$1"
+  local pre="${DEMO_PAUSE_BEFORE_DESCRIBE_SEC:-5}"
+  local post="${DEMO_PAUSE_AFTER_DESCRIBE_SEC:-4}"
+  echo
+  echo "╔══════════════════════════════════════════════════════════════════════════════╗"
+  echo "║  Hub CR — oc describe + events (pause so audience maps plan → live object)  ║"
+  echo "╚══════════════════════════════════════════════════════════════════════════════╝"
+  if [[ "$pre" != "0" ]]; then
+    echo "(pause ${pre}s — relate opening YAML/plan to this ComputeInstance on-cluster)"
+    sleep "$pre"
+  fi
+  echo "=== oc describe computeinstance/$name -n $NS ==="
+  oc_hub describe computeinstance "$name" -n "$NS" || true
+  echo
+  echo "=== oc get events (wide if supported) — ComputeInstance $name — Type / Reason / Message ==="
+  if oc_hub get events -n "$NS" \
+    --field-selector "involvedObject.kind=ComputeInstance,involvedObject.name=${name}" \
+    --sort-by='.lastTimestamp' -o wide 2>/dev/null | tail -30; then
+    :
+  else
+    oc_hub get events -n "$NS" \
+      --field-selector "involvedObject.kind=ComputeInstance,involvedObject.name=${name}" \
+      --sort-by='.lastTimestamp' 2>/dev/null | tail -30 || true
+  fi
+  echo
+  if [[ "$post" != "0" ]]; then
+    echo "(pause ${post}s before next script step)"
+    sleep "$post"
+  fi
+  demo_pause "continue after describe & events"
 }
 
 # Demo scenario 3: phase can be Running while ConfigurationApplied is still False (MGMT-23147 narrative).
@@ -444,6 +487,12 @@ for ((i = 1; i <= WAIT_CR_RETRIES; i++)); do
   sleep "$WAIT_CR_DELAY"
 done
 [[ -n "$NAME" ]] || die "Timed out waiting for ComputeInstance CR"
+
+if [[ "$SKIP_DESCRIBE" -ne 1 ]]; then
+  show_describe_and_events "$NAME"
+else
+  echo "(skipping oc describe + events block — --no-describe)"
+fi
 
 if [[ "$DELETE_DURING" -eq 1 ]]; then
   if [[ "$POLL_EARLY" -eq 1 ]]; then

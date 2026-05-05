@@ -17,6 +17,7 @@
 #   bash scripts/mgmt23147_demo_e2e.sh
 #
 #   bash scripts/mgmt23147_demo_e2e.sh --keep   # leave instance; print UUID and NAME
+#   bash scripts/mgmt23147_demo_e2e.sh --scenario-config-gap   # after Running, poll until ConfigurationApplied=True
 #
 # Environment (defaults match tests/conftest.py and tests/vmaas/conftest.py):
 #   OSAC_NAMESPACE          (default: osac-devel)
@@ -27,15 +28,18 @@
 #   OSAC_HUB_KUBECONFIG     (optional; overrides KUBECONFIG for oc + token script)
 #   WAIT_CR_RETRIES / WAIT_CR_DELAY       (default 30 / 2s)  wait for CR to exist
 #   WAIT_RUNNING_RETRIES / WAIT_RUNNING_DELAY (default 90 / 10s) wait for phase Running
+#   CONFIG_GAP_MAX_SECONDS   (default 120) max wait for ConfigurationApplied when using --scenario-config-gap
 
 set -euo pipefail
 
 KEEP=0
+CONFIG_GAP=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --keep) KEEP=1 ;;
+    --scenario-config-gap) CONFIG_GAP=1 ;;
     -h|--help)
-      sed -n '1,35p' "$0"
+      sed -n '1,40p' "$0"
       exit 0
       ;;
     *)
@@ -102,9 +106,50 @@ parse_uuid() {
 print_conditions() {
   local name="$1"
   echo
-  echo "=== conditions (type / status / reason / message) ==="
-  oc_hub get computeinstance "$name" -n "$NS" -o jsonpath='
+  echo "=== conditions (TYPE / STATUS / REASON / MESSAGE) ==="
+  local json tmp
+  json="$(oc_hub get computeinstance "$name" -n "$NS" -o json 2>/dev/null || true)"
+  if [[ -z "$json" ]]; then
+    echo "(could not read ComputeInstance)"
+    echo
+    return
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    tmp="$(mktemp)"
+    printf '%s' "$json" >"$tmp"
+    python3 <<PY || true
+import json
+
+order = "Provisioned ConfigurationApplied Ready RestartRequired RestartInProgress".split()
+with open("$tmp", encoding="utf-8") as f:
+    data = json.load(f)
+conds = data.get("status", {}).get("conditions") or []
+
+def key(c):
+    t = c.get("type", "")
+    try:
+        return (0, order.index(t), t)
+    except ValueError:
+        return (1, t, t)
+
+print(f"{'TYPE':<30} {'STATUS':<12} {'REASON':<28} MESSAGE")
+for c in sorted(conds, key=key):
+    print(
+        f"{c.get('type', ''):<30} {c.get('status', ''):<12} {c.get('reason', ''):<28} {c.get('message', '')}"
+    )
+PY
+    rm -f "$tmp"
+  elif command -v column >/dev/null 2>&1; then
+    {
+      printf '%s\t%s\t%s\t%s\n' TYPE STATUS REASON MESSAGE
+      oc_hub get computeinstance "$name" -n "$NS" -o jsonpath='
 {range .status.conditions[*]}{.type}{"\t"}{.status}{"\t"}{.reason}{"\t"}{.message}{"\n"}{end}' 2>/dev/null || true
+    } | column -t -s $'\t'
+  else
+    printf '%s\t%s\t%s\t%s\n' TYPE STATUS REASON MESSAGE
+    oc_hub get computeinstance "$name" -n "$NS" -o jsonpath='
+{range .status.conditions[*]}{.type}{"\t"}{.status}{"\t"}{.reason}{"\t"}{.message}{"\n"}{end}' 2>/dev/null || true
+  fi
   echo
 }
 
@@ -115,6 +160,32 @@ print_events() {
     --field-selector "involvedObject.kind=ComputeInstance,involvedObject.name=${name}" \
     --sort-by='.lastTimestamp' 2>/dev/null | tail -15 || true
   echo
+}
+
+# Demo scenario 3: phase can be Running while ConfigurationApplied is still False (MGMT-23147 narrative).
+watch_config_gap() {
+  local name="$1"
+  local max="${CONFIG_GAP_MAX_SECONDS:-120}"
+  local interval=2
+  local elapsed=0
+  echo "--- scenario 3: phase vs ConfigurationApplied (poll every ${interval}s, max ${max}s) ---"
+  echo "(Expect: phase=Running can appear while ConfigurationApplied is still False / Applying configuration.)"
+  echo
+  while [[ "$elapsed" -lt "$max" ]]; do
+    phase="$(oc_hub get computeinstance "$name" -n "$NS" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+    ca_s="$(oc_hub get computeinstance "$name" -n "$NS" -o jsonpath='{.status.conditions[?(@.type=="ConfigurationApplied")].status}' 2>/dev/null || true)"
+    ca_r="$(oc_hub get computeinstance "$name" -n "$NS" -o jsonpath='{.status.conditions[?(@.type=="ConfigurationApplied")].reason}' 2>/dev/null || true)"
+    ca_m="$(oc_hub get computeinstance "$name" -n "$NS" -o jsonpath='{.status.conditions[?(@.type=="ConfigurationApplied")].message}' 2>/dev/null || true)"
+    echo "  t=${elapsed}s  phase=${phase:-<empty>}  ConfigurationApplied: status=${ca_s:-?} reason=${ca_r:-?} message=${ca_m:-?}"
+    if [[ "$ca_s" == "True" ]]; then
+      echo "  ConfigurationApplied is True — config caught up with phase."
+      return 0
+    fi
+    sleep "$interval"
+    elapsed=$((elapsed + interval))
+  done
+  echo "  (timeout) ConfigurationApplied still not True after ${max}s — show final table below." >&2
+  return 0
 }
 
 need_cmd oc
@@ -175,6 +246,11 @@ for ((i = 0; i < WAIT_RUNNING_RETRIES; i++)); do
   fi
   sleep "$WAIT_RUNNING_DELAY"
 done
+
+if [[ "$phase" == "Running" && "$CONFIG_GAP" -eq 1 ]]; then
+  watch_config_gap "$NAME"
+  echo
+fi
 
 print_conditions "$NAME"
 if [[ "$phase" != "Running" ]]; then

@@ -18,6 +18,9 @@
 #
 #   bash scripts/mgmt23147_demo_e2e.sh --keep   # leave instance; print UUID and NAME
 #   bash scripts/mgmt23147_demo_e2e.sh --scenario-config-gap   # after Running, poll until ConfigurationApplied=True
+#   bash scripts/mgmt23147_demo_e2e.sh --preview                # print planned commands + illustrative YAML; exit (no API changes)
+#   bash scripts/mgmt23147_demo_e2e.sh --step                  # pause before login, create, and delete (audience can read screen)
+#   DEMO_STEP=1 bash scripts/mgmt23147_demo_e2e.sh             # same as --step
 #
 # Environment (defaults match tests/conftest.py and tests/vmaas/conftest.py):
 #   OSAC_NAMESPACE          (default: osac-devel)
@@ -29,17 +32,22 @@
 #   WAIT_CR_RETRIES / WAIT_CR_DELAY       (default 30 / 2s)  wait for CR to exist
 #   WAIT_RUNNING_RETRIES / WAIT_RUNNING_DELAY (default 90 / 10s) wait for phase Running
 #   CONFIG_GAP_MAX_SECONDS   (default 120) max wait for ConfigurationApplied when using --scenario-config-gap
+#   DEMO_NO_PLAN=1           skip printing the opening command/YAML plan (not recommended for live demos)
 
 set -euo pipefail
 
 KEEP=0
 CONFIG_GAP=0
+PREVIEW_ONLY=0
+DEMO_STEP="${DEMO_STEP:-0}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --keep) KEEP=1 ;;
     --scenario-config-gap) CONFIG_GAP=1 ;;
+    --preview) PREVIEW_ONLY=1 ;;
+    --step) DEMO_STEP=1 ;;
     -h|--help)
-      sed -n '1,40p' "$0"
+      sed -n '1,55p' "$0"
       exit 0
       ;;
     *)
@@ -90,6 +98,62 @@ token_script() {
   else
     printf 'oc create token -n %q %q --duration 1h --as system:admin' "$NS" "$SA"
   fi
+}
+
+demo_pause() {
+  [[ "$DEMO_STEP" != "1" ]] && return 0
+  local msg="${1:-next step}"
+  read -r -p ">>> [demo pause: ${msg}] Press Enter to run the command above... " _ || true
+  echo
+}
+
+# Print commands and illustrative YAML before any mutating osac calls (for slides / live demos).
+show_demo_plan() {
+  local ts
+  ts="$(token_script)"
+  echo
+  echo "╔══════════════════════════════════════════════════════════════════════════════╗"
+  echo "║  DEMO PLAN — commands (nothing runs below until you see 'Executing now')    ║"
+  echo "╚══════════════════════════════════════════════════════════════════════════════╝"
+  echo
+  echo "──────── 1) Login (fulfillment; token via --token-script) ────────"
+  printf '%s login --address %q --insecure --token-script %q\n' "$OSAC_BIN" "$ADDR" "$ts"
+  echo
+  echo "──────── 2) Create ComputeInstance (API; template + flags below) ────────"
+  printf '%s create computeinstance \\\n' "$OSAC_BIN"
+  printf '  --template %q \\\n' "$TEMPLATE"
+  printf '  --cores 2 \\\n'
+  printf '  --memory-gib 4 \\\n'
+  printf '  --boot-disk-size 20 \\\n'
+  printf '  --image %q \\\n' "quay.io/containerdisks/fedora:latest"
+  printf '  --image-source-type registry \\\n'
+  printf '  --run-strategy Always\n'
+  echo
+  echo "──────── 3) Inspect (this script only reads hub with oc; no YAML apply) ────────"
+  echo "oc get computeinstance -n \"$NS\" -l 'osac.openshift.io/computeinstance-uuid=<UUID>' ..."
+  echo "oc get computeinstance <name> -n \"$NS\" -o jsonpath='{.status.phase}' ..."
+  echo
+  echo "──────── 4) Cleanup (unless --keep) ────────"
+  echo "$OSAC_BIN delete computeinstance '<UUID-from-create>'"
+  echo
+  echo "──────── Illustrative hub YAML (real spec/status filled by fulfillment/operator) ────────"
+  cat <<YAML
+# Not applied from disk — created on hub after step 2.
+apiVersion: osac.openshift.io/v1alpha1
+kind: ComputeInstance
+metadata:
+  namespace: ${NS}
+  labels:
+    osac.openshift.io/computeinstance-uuid: "<uuid printed by osac create>"
+  # name: assigned by controller / fulfillment (e.g. vm-xxxxx)
+spec:
+  # Template: ${TEMPLATE}
+  # Plus cores, memory, boot disk, image, runStrategy from CLI (see command block above).
+status:
+  # Populated by osac-operator (phase, conditions with reason/message, jobs, ...)
+  # MGMT-23147: status.conditions[].reason / .message + guarded Events
+YAML
+  echo
 }
 
 parse_uuid() {
@@ -200,12 +264,32 @@ echo "=== MGMT-23147 demo E2E ==="
 echo "Namespace: $NS"
 echo "Template:  $TEMPLATE"
 echo "Fulfillment: $ADDR"
+echo "Hub kubeconfig: $HUB_KC"
 echo
 
-echo "--- osac login ---"
+if [[ "$PREVIEW_ONLY" -eq 1 ]] || [[ "${DEMO_NO_PLAN:-0}" != "1" ]]; then
+  show_demo_plan
+fi
+if [[ "$PREVIEW_ONLY" -eq 1 ]]; then
+  echo "(--preview) Stopping before any login/create/delete."
+  exit 0
+fi
+
+echo "╔══════════════════════════════════════════════════════════════════════════════╗"
+echo "║  EXECUTION — mutating commands follow                                        ║"
+echo "╚══════════════════════════════════════════════════════════════════════════════╝"
+
+echo
+echo "──────── Executing now: osac login ────────"
+printf '%s login --address %q --insecure --token-script %q\n' "$OSAC_BIN" "$ADDR" "$TS"
+demo_pause "osac login"
 "$OSAC_BIN" login --address "$ADDR" --insecure --token-script "$TS"
 
-echo "--- osac create computeinstance ---"
+echo
+echo "──────── Executing now: osac create computeinstance ────────"
+printf '%s create computeinstance \\\n  --template %q \\\n  --cores 2 --memory-gib 4 --boot-disk-size 20 \\\n  --image %q --image-source-type registry --run-strategy Always\n' \
+  "$OSAC_BIN" "$TEMPLATE" "quay.io/containerdisks/fedora:latest"
+demo_pause "osac create computeinstance"
 CREATE_OUT="$("$OSAC_BIN" create computeinstance \
   --template "$TEMPLATE" \
   --cores 2 \
@@ -258,6 +342,8 @@ if [[ "$phase" != "Running" ]]; then
   print_events "$NAME"
   [[ "$KEEP" -eq 1 ]] || {
     echo "--- cleanup: osac delete ---"
+    printf '%s delete computeinstance %q\n' "$OSAC_BIN" "$UUID"
+    demo_pause "osac delete (cleanup after non-Running)"
     "$OSAC_BIN" delete computeinstance "$UUID" || true
   }
   exit 1
@@ -270,9 +356,12 @@ oc_hub get computeinstance "$NAME" -n "$NS" -o wide
 echo "UUID=$UUID NAME=$NAME NS=$NS"
 
 if [[ "$KEEP" -eq 1 ]]; then
-  echo "Kept instance (--keep). Delete later: osac delete computeinstance '$UUID'"
+  echo "Kept instance (--keep). Delete later:"
+  printf '%s delete computeinstance %q\n' "$OSAC_BIN" "$UUID"
 else
   echo "--- cleanup: osac delete ---"
+  printf '%s delete computeinstance %q\n' "$OSAC_BIN" "$UUID"
+  demo_pause "osac delete (cleanup)"
   "$OSAC_BIN" delete computeinstance "$UUID"
   echo "Delete submitted; wait for CR to disappear if needed: oc get computeinstance '$NAME' -n '$NS'"
 fi

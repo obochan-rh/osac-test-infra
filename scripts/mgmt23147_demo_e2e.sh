@@ -162,6 +162,7 @@ show_demo_plan() {
   echo
   echo "──────── 4) Cleanup (unless --keep) ────────"
   echo "$OSAC_BIN delete computeinstance '<UUID-from-create>'"
+  echo "wait for CR to disappear, then print final ComputeInstance event tail"
   echo
   echo "──────── Illustrative hub YAML (real spec/status filled by fulfillment/operator) ────────"
   cat <<YAML
@@ -261,6 +262,30 @@ print_events() {
   oc_hub get events -n "$NS" \
     --field-selector "involvedObject.kind=ComputeInstance,involvedObject.name=${name}" \
     --sort-by='.lastTimestamp' 2>/dev/null | tail -15 || true
+  echo
+}
+
+wait_for_computeinstance_gone() {
+  local name="$1"
+  local i
+  echo "--- wait for ComputeInstance CR to disappear (up to $((DELETE_WAIT_RETRIES * DELETE_WAIT_DELAY))s) ---"
+  for ((i = 0; i < DELETE_WAIT_RETRIES; i++)); do
+    if ! oc_hub get computeinstance "$name" -n "$NS" &>/dev/null; then
+      echo "CR deleted (after ${i} wait(s))"
+      return 0
+    fi
+    sleep "$DELETE_WAIT_DELAY"
+  done
+  echo "WARN: CR still present after delete wait — check manually" >&2
+  return 1
+}
+
+print_post_delete_events() {
+  local name="$1"
+  echo "=== recent events after delete (ComputeInstance) ==="
+  oc_hub get events -n "$NS" \
+    --field-selector "involvedObject.kind=ComputeInstance,involvedObject.name=${name}" \
+    --sort-by='.lastTimestamp' 2>/dev/null | tail -20 || true
   echo
 }
 
@@ -558,6 +583,8 @@ if [[ "$phase" != "Running" ]]; then
     printf '%s delete computeinstance %q\n' "$OSAC_BIN" "$UUID"
     demo_pause "osac delete (cleanup after non-Running)"
     "$OSAC_BIN" delete computeinstance "$UUID" || true
+    wait_for_computeinstance_gone "$NAME" || true
+    print_post_delete_events "$NAME"
   }
   exit 1
 fi
@@ -578,7 +605,8 @@ else
   printf '%s delete computeinstance %q\n' "$OSAC_BIN" "$UUID"
   demo_pause "osac delete (cleanup)"
   "$OSAC_BIN" delete computeinstance "$UUID"
-  echo "Delete submitted; wait for CR to disappear if needed: oc get computeinstance '$NAME' -n '$NS'"
+  wait_for_computeinstance_gone "$NAME" || true
+  print_post_delete_events "$NAME"
 fi
 
 echo "Done."

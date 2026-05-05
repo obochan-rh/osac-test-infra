@@ -19,7 +19,7 @@
 #   bash scripts/mgmt23147_demo_e2e.sh --keep   # leave instance; print UUID and NAME
 #   bash scripts/mgmt23147_demo_e2e.sh --scenario-config-gap   # after Running, poll until ConfigurationApplied=True
 #   bash scripts/mgmt23147_demo_e2e.sh --preview                # print planned commands + illustrative YAML; exit (no API changes)
-#   bash scripts/mgmt23147_demo_e2e.sh --step                  # pause before login, create, and delete (audience can read screen)
+#   bash scripts/mgmt23147_demo_e2e.sh --step                  # interactive pauses: login, create, wait CR, describe+events, poll-early, Running wait, config-gap, summaries, delete
 #   DEMO_STEP=1 bash scripts/mgmt23147_demo_e2e.sh             # same as --step
 #   bash scripts/mgmt23147_demo_e2e.sh --poll-early             # after CR exists, poll conditions+events for POLL_EARLY_SECONDS (default 90) before waiting for Running
 #   POLL_EARLY_SECONDS=120 POLL_EARLY_INTERVAL=5 .../mgmt23147_demo_e2e.sh --poll-early
@@ -32,6 +32,7 @@
 #   OSAC_CLI_PATH           (default: osac)
 #   OSAC_FULFILLMENT_ADDRESS (optional; default: derived from ingress + namespace)
 #   OSAC_HUB_KUBECONFIG     (optional; overrides KUBECONFIG for oc + token script)
+#   OSAC_OC_EXTRA_ARGS      (optional; extra flags for every hub "oc" invocation, e.g. --as system:admin on MOC)
 #   WAIT_CR_RETRIES / WAIT_CR_DELAY       (default 30 / 2s)  wait for CR to exist
 #   WAIT_RUNNING_RETRIES / WAIT_RUNNING_DELAY (default 90 / 10s) wait for phase Running
 #   CONFIG_GAP_MAX_SECONDS   (default 120) max wait for ConfigurationApplied when using --scenario-config-gap
@@ -90,10 +91,15 @@ DEMO_PAUSE_BEFORE_DESCRIBE_SEC="${DEMO_PAUSE_BEFORE_DESCRIBE_SEC:-5}"
 DEMO_PAUSE_AFTER_DESCRIBE_SEC="${DEMO_PAUSE_AFTER_DESCRIBE_SEC:-4}"
 
 oc_hub() {
+  local -a oc_extra=()
+  if [[ -n "${OSAC_OC_EXTRA_ARGS:-}" ]]; then
+    # shellcheck disable=SC2206
+    oc_extra=( ${OSAC_OC_EXTRA_ARGS} )
+  fi
   if [[ -n "$HUB_KC" ]]; then
-    command oc --kubeconfig="$HUB_KC" "$@"
+    command oc --kubeconfig="$HUB_KC" "${oc_extra[@]}" "$@"
   else
-    command oc "$@"
+    command oc "${oc_extra[@]}" "$@"
   fi
 }
 
@@ -267,6 +273,7 @@ show_describe_and_events() {
   echo "╔══════════════════════════════════════════════════════════════════════════════╗"
   echo "║  Hub CR — oc describe + events (pause so audience maps plan → live object)  ║"
   echo "╚══════════════════════════════════════════════════════════════════════════════╝"
+  demo_pause "before oc describe + events block"
   if [[ "$pre" != "0" ]]; then
     echo "(pause ${pre}s — relate opening YAML/plan to this ComputeInstance on-cluster)"
     sleep "$pre"
@@ -363,6 +370,7 @@ poll_early_period() {
   done
   echo "(end scenario 2 poll — continuing to wait for Running if applicable)"
   echo
+  demo_pause "after scenario 2 (--poll-early) — next: wait for Running"
 }
 
 # Scenario 5: delete while provision job is non-terminal (mirrors test_compute_instance_delete_during_provision).
@@ -447,11 +455,13 @@ echo "╔═══════════════════════�
 echo "║  EXECUTION — mutating commands follow                                        ║"
 echo "╚══════════════════════════════════════════════════════════════════════════════╝"
 
+demo_pause "start execution (after plan) — next: osac login"
 echo
 echo "──────── Executing now: osac login ────────"
 printf '%s login --address %q --insecure --token-script %q\n' "$OSAC_BIN" "$ADDR" "$TS"
 demo_pause "osac login"
 "$OSAC_BIN" login --address "$ADDR" --insecure --token-script "$TS"
+demo_pause "after osac login — next: create computeinstance"
 
 echo
 echo "──────── Executing now: osac create computeinstance ────────"
@@ -473,6 +483,7 @@ UUID="$(parse_uuid "$CREATE_OUT")"
 
 echo
 echo "UUID=$UUID"
+demo_pause "after create — UUID known; next: wait for ComputeInstance CR on hub"
 
 echo "--- wait for ComputeInstance CR (label osac.openshift.io/computeinstance-uuid) ---"
 NAME=""
@@ -487,6 +498,8 @@ for ((i = 1; i <= WAIT_CR_RETRIES; i++)); do
   sleep "$WAIT_CR_DELAY"
 done
 [[ -n "$NAME" ]] || die "Timed out waiting for ComputeInstance CR"
+
+demo_pause "CR on hub — NAME=$NAME; next: describe + events (and optional narrate sleep)"
 
 if [[ "$SKIP_DESCRIBE" -ne 1 ]]; then
   show_describe_and_events "$NAME"
@@ -512,9 +525,11 @@ if [[ "$DELETE_DURING" -eq 1 ]]; then
 fi
 
 if [[ "$POLL_EARLY" -eq 1 ]]; then
+  demo_pause "before scenario 2 (--poll-early) — early conditions + events window"
   poll_early_period "$NAME"
 fi
 
+demo_pause "before wait for status.phase Running (poll loop)"
 echo "--- wait for status.phase == Running (timeout: $((WAIT_RUNNING_RETRIES * WAIT_RUNNING_DELAY))s) ---"
 phase=""
 for ((i = 0; i < WAIT_RUNNING_RETRIES; i++)); do
@@ -527,13 +542,16 @@ for ((i = 0; i < WAIT_RUNNING_RETRIES; i++)); do
 done
 
 if [[ "$phase" == "Running" && "$CONFIG_GAP" -eq 1 ]]; then
+  demo_pause "before scenario 3 (--scenario-config-gap) — ConfigurationApplied vs phase"
   watch_config_gap "$NAME"
   echo
 fi
 
+demo_pause "before final conditions table"
 print_conditions "$NAME"
 if [[ "$phase" != "Running" ]]; then
   echo "WARN: phase is not Running (got: ${phase:-empty}) — still showing status for demo" >&2
+  demo_pause "non-Running — before events tail"
   print_events "$NAME"
   [[ "$KEEP" -eq 1 ]] || {
     echo "--- cleanup: osac delete ---"
@@ -544,8 +562,10 @@ if [[ "$phase" != "Running" ]]; then
   exit 1
 fi
 
+demo_pause "before final events tail"
 print_events "$NAME"
 
+demo_pause "before summary (oc get -o wide)"
 echo "=== summary ==="
 oc_hub get computeinstance "$NAME" -n "$NS" -o wide
 echo "UUID=$UUID NAME=$NAME NS=$NS"

@@ -21,6 +21,9 @@
 #   bash scripts/mgmt23147_demo_e2e.sh --preview                # print planned commands + illustrative YAML; exit (no API changes)
 #   bash scripts/mgmt23147_demo_e2e.sh --step                  # pause before login, create, and delete (audience can read screen)
 #   DEMO_STEP=1 bash scripts/mgmt23147_demo_e2e.sh             # same as --step
+#   bash scripts/mgmt23147_demo_e2e.sh --poll-early             # after CR exists, poll conditions+events for POLL_EARLY_SECONDS (default 90) before waiting for Running
+#   POLL_EARLY_SECONDS=120 POLL_EARLY_INTERVAL=5 .../mgmt23147_demo_e2e.sh --poll-early
+#   bash scripts/mgmt23147_demo_e2e.sh --delete-during-provision   # cancel: wait for provision job in-flight, then delete (no Running wait); needs python3
 #
 # Environment (defaults match tests/conftest.py and tests/vmaas/conftest.py):
 #   OSAC_NAMESPACE          (default: osac-devel)
@@ -33,6 +36,9 @@
 #   WAIT_RUNNING_RETRIES / WAIT_RUNNING_DELAY (default 90 / 10s) wait for phase Running
 #   CONFIG_GAP_MAX_SECONDS   (default 120) max wait for ConfigurationApplied when using --scenario-config-gap
 #   DEMO_NO_PLAN=1           skip printing the opening command/YAML plan (not recommended for live demos)
+#   POLL_EARLY_SECONDS       (default 90) wall-clock window for --poll-early
+#   POLL_EARLY_INTERVAL      (default 10) seconds between polls for --poll-early
+#   DELETE_WAIT_RETRIES / DELETE_WAIT_DELAY  (default 60 / 5) wait for CR gone after delete-during-provision
 
 set -euo pipefail
 
@@ -40,14 +46,18 @@ KEEP=0
 CONFIG_GAP=0
 PREVIEW_ONLY=0
 DEMO_STEP="${DEMO_STEP:-0}"
+POLL_EARLY=0
+DELETE_DURING=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --keep) KEEP=1 ;;
     --scenario-config-gap) CONFIG_GAP=1 ;;
     --preview) PREVIEW_ONLY=1 ;;
     --step) DEMO_STEP=1 ;;
+    --poll-early) POLL_EARLY=1 ;;
+    --delete-during-provision) DELETE_DURING=1 ;;
     -h|--help)
-      sed -n '1,55p' "$0"
+      sed -n '1,75p' "$0"
       exit 0
       ;;
     *)
@@ -67,6 +77,10 @@ WAIT_CR_RETRIES="${WAIT_CR_RETRIES:-30}"
 WAIT_CR_DELAY="${WAIT_CR_DELAY:-2}"
 WAIT_RUNNING_RETRIES="${WAIT_RUNNING_RETRIES:-90}"
 WAIT_RUNNING_DELAY="${WAIT_RUNNING_DELAY:-10}"
+POLL_EARLY_SECONDS="${POLL_EARLY_SECONDS:-90}"
+POLL_EARLY_INTERVAL="${POLL_EARLY_INTERVAL:-10}"
+DELETE_WAIT_RETRIES="${DELETE_WAIT_RETRIES:-60}"
+DELETE_WAIT_DELAY="${DELETE_WAIT_DELAY:-5}"
 
 oc_hub() {
   if [[ -n "$HUB_KC" ]]; then
@@ -153,6 +167,15 @@ status:
   # Populated by osac-operator (phase, conditions with reason/message, jobs, ...)
   # MGMT-23147: status.conditions[].reason / .message + guarded Events
 YAML
+  echo
+  if [[ "$POLL_EARLY" -eq 1 ]]; then
+    echo "──────── Optional: --poll-early (scenario 2) ────────"
+    echo "After CR exists: poll conditions + events every ${POLL_EARLY_INTERVAL}s for ${POLL_EARLY_SECONDS}s, then wait for Running."
+  fi
+  if [[ "$DELETE_DURING" -eq 1 ]]; then
+    echo "──────── Optional: --delete-during-provision (scenario 5) ────────"
+    echo "After provision job is Running/Pending/Unknown: osac delete; wait CR gone. (Skips Running wait; ignores --poll-early / --scenario-config-gap.)"
+  fi
   echo
 }
 
@@ -252,6 +275,108 @@ watch_config_gap() {
   return 0
 }
 
+# Latest job field from status.jobs (matches tests/k8s_client.py). Requires python3.
+get_latest_job_field() {
+  local name="$1" job_type="$2" field="$3"
+  oc_hub get computeinstance "$name" -n "$NS" -o json 2>/dev/null \
+    | JOB_TYPE="$job_type" JOB_FIELD="$field" python3 -c '
+import json, os, sys
+typ, field = os.environ["JOB_TYPE"], os.environ["JOB_FIELD"]
+data = json.load(sys.stdin)
+jobs = [j for j in data.get("status", {}).get("jobs", []) if j.get("type") == typ]
+if not jobs:
+    print("")
+else:
+    j = sorted(jobs, key=lambda x: str(x.get("timestamp", "")), reverse=True)[0]
+    v = j.get(field, "")
+    print(v if v is not None else "")
+' || echo ""
+}
+
+# Scenario 2: poll conditions + events during early provisioning (before / while Waiting for Running).
+poll_early_period() {
+  local name="$1"
+  local start now deadline
+  start="$(date +%s)"
+  deadline=$((start + POLL_EARLY_SECONDS))
+  echo
+  echo "╔══════════════════════════════════════════════════════════════════════════════╗"
+  echo "║  Scenario 2 — early provisioning (${POLL_EARLY_SECONDS}s, every ${POLL_EARLY_INTERVAL}s)   ║"
+  echo "╚══════════════════════════════════════════════════════════════════════════════╝"
+  while true; do
+    now="$(date +%s)"
+    if [[ "$now" -ge "$deadline" ]]; then
+      break
+    fi
+    echo "=== $(date -Is)  (t=$((now - start))s / ${POLL_EARLY_SECONDS}s) ==="
+    oc_hub get computeinstance "$name" -n "$NS" -o jsonpath='phase={.status.phase}{"  jobs="}{range .status.jobs[*]}{.type}{":"}{.state}{" "}{end}{"\n"}' 2>/dev/null || true
+    print_conditions "$name"
+    echo "--- last events ---"
+    oc_hub get events -n "$NS" \
+      --field-selector "involvedObject.kind=ComputeInstance,involvedObject.name=${name}" \
+      --sort-by='.lastTimestamp' 2>/dev/null | tail -6 || true
+    echo
+    sleep "$POLL_EARLY_INTERVAL"
+  done
+  echo "(end scenario 2 poll — continuing to wait for Running if applicable)"
+  echo
+}
+
+# Scenario 5: delete while provision job is non-terminal (mirrors test_compute_instance_delete_during_provision).
+run_delete_during_provision() {
+  local name="$1"
+  need_cmd python3
+  echo
+  echo "╔══════════════════════════════════════════════════════════════════════════════╗"
+  echo "║  Scenario 5 — delete during provision                                         ║"
+  echo "╚══════════════════════════════════════════════════════════════════════════════╝"
+  echo "--- wait for provision job id (same as e2e: up to 30 × 2s) ---"
+  local i prov_id prov_state deprov_id
+  prov_id=""
+  for ((i = 1; i <= 30; i++)); do
+    prov_id="$(get_latest_job_field "$name" "provision" "jobID")"
+    if [[ -n "$prov_id" ]]; then
+      echo "provision jobID=$prov_id (attempt $i)"
+      break
+    fi
+    sleep 2
+  done
+  [[ -n "$prov_id" ]] || die "No provision job id — cannot demo delete-during-provision"
+
+  prov_state="$(get_latest_job_field "$name" "provision" "state")"
+  deprov_id="$(get_latest_job_field "$name" "deprovision" "jobID")"
+  echo "provision state=$prov_state deprovision jobID=${deprov_id:-<empty>}"
+  case "$prov_state" in
+    Running|Pending|Unknown) ;;
+    *) die "Expected provision in progress (Running|Pending|Unknown), got: $prov_state" ;;
+  esac
+  [[ -z "$deprov_id" ]] || die "Deprovision job should not exist before delete (got jobID=$deprov_id)"
+
+  print_conditions "$name"
+  echo "--- osac delete (during provision) ---"
+  printf '%s delete computeinstance %q\n' "$OSAC_BIN" "$UUID"
+  demo_pause "osac delete during provision"
+  "$OSAC_BIN" delete computeinstance "$UUID"
+
+  echo "--- wait for CR to disappear (up to $((DELETE_WAIT_RETRIES * DELETE_WAIT_DELAY))s) ---"
+  for ((i = 0; i < DELETE_WAIT_RETRIES; i++)); do
+    if ! oc_hub get computeinstance "$name" -n "$NS" &>/dev/null; then
+      echo "CR deleted (after ${i} wait(s))"
+      break
+    fi
+    sleep "$DELETE_WAIT_DELAY"
+  done
+  if oc_hub get computeinstance "$name" -n "$NS" &>/dev/null; then
+    echo "WARN: CR still present after wait — check manually" >&2
+  fi
+  echo "--- recent events (may still list past involvedObject) ---"
+  oc_hub get events -n "$NS" \
+    --field-selector "involvedObject.kind=ComputeInstance,involvedObject.name=${name}" \
+    --sort-by='.lastTimestamp' 2>/dev/null | tail -20 || true
+  echo
+  echo "Scenario 5 done (virt orphan check is manual: VM label osac.openshift.io/computeinstance=$name)."
+}
+
 need_cmd oc
 need_cmd "$OSAC_BIN"
 [[ -n "$HUB_KC" ]] || die "Set KUBECONFIG or OSAC_HUB_KUBECONFIG to the hub kubeconfig file"
@@ -319,6 +444,27 @@ for ((i = 1; i <= WAIT_CR_RETRIES; i++)); do
   sleep "$WAIT_CR_DELAY"
 done
 [[ -n "$NAME" ]] || die "Timed out waiting for ComputeInstance CR"
+
+if [[ "$DELETE_DURING" -eq 1 ]]; then
+  if [[ "$POLL_EARLY" -eq 1 ]]; then
+    echo "NOTE: --delete-during-provision ignores --poll-early" >&2
+    POLL_EARLY=0
+  fi
+  if [[ "$CONFIG_GAP" -eq 1 ]]; then
+    echo "NOTE: --delete-during-provision ignores --scenario-config-gap" >&2
+    CONFIG_GAP=0
+  fi
+  if [[ "$KEEP" -eq 1 ]]; then
+    echo "NOTE: --delete-during-provision supersedes --keep (instance is deleted)" >&2
+  fi
+  run_delete_during_provision "$NAME"
+  echo "Done."
+  exit 0
+fi
+
+if [[ "$POLL_EARLY" -eq 1 ]]; then
+  poll_early_period "$NAME"
+fi
 
 echo "--- wait for status.phase == Running (timeout: $((WAIT_RUNNING_RETRIES * WAIT_RUNNING_DELAY))s) ---"
 phase=""
